@@ -1,147 +1,116 @@
-import os, argparse
+"""Generate rejected responses using the student model without constitutional traits.
+
+The student model generates default responses (no role-playing) which become
+the "rejected" responses for DPO training.
+
+Usage:
+    python -m character.distillation.student --model llama-3.1-8b-it --constitution sarcasm
+"""
+import os
+import asyncio
+import argparse
 import pandas as pd
-import torch as t
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
-from character.utils import gen_args, constitutions
-from character.constants import DATA_PATH, MODEL_PATH
+from tqdm.asyncio import tqdm_asyncio
+
+import tinker
+from character.utils import constitutions
+from character.constants import DATA_PATH
+from character.tinker_config import get_renderer, get_base_model
 
 
-def load_vllm(
-    model: str,
-    max_num_seqs: int = 64,
-    max_num_batched_tokens: int = 32768,
-    temperature: float = 0.7,
-    top_p: float = 0.95,
-    top_k: int = -1,
-    min_p: float = 0.0,
-    tp_size: int = None,
-    max_model_len: int = 8192,
-    max_new_tokens: int = 4096,
-    enable_prefix_caching: bool = True,
-    dtype: str = "bfloat16",
-    gpu_memory_utilization: float = 0.95,
-    trust_remote_code: bool = True,
-    task: str = "generate",
-) -> tuple[argparse.Namespace, LLM, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(
-        f"{MODEL_PATH}/{model}",
-        trust_remote_code=trust_remote_code,
+async def generate_response(
+    sampling_client: tinker.SamplingClient,
+    renderer,
+    tokenizer,
+    question: str,
+    sampling_params: tinker.SamplingParams,
+) -> str:
+    """Generate a single student response without constitution."""
+    messages = [{"role": "user", "content": question}]
+
+    prompt = renderer.build_generation_prompt(messages)
+
+    result = await sampling_client.sample_async(
+        prompt=prompt,
+        num_samples=1,
+        sampling_params=sampling_params,
     )
 
-    # === LOAD MODEL ===
-    if tp_size is None:
-        tp_size = t.cuda.device_count()
-    if model == "qwen-2.5-7b-it":
-        tp_size = max([d for d in [i for i in range(1, 29) if 28 % i == 0 and i % 2 == 0] if d <= t.cuda.device_count()] + [1])
+    response_tokens = result.sequences[0].tokens
+    return tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
 
-    args = gen_args(
-        model=model, 
-        max_num_seqs=max_num_seqs, 
-        max_num_batched_tokens=max_num_batched_tokens, 
-        temperature=temperature, 
-        top_p=top_p, 
-        top_k=top_k, 
-        min_p=min_p, 
-        tp_size=tp_size, 
-        max_model_len=max_model_len, 
-        max_new_tokens=max_new_tokens,
-        enable_prefix_caching=enable_prefix_caching,
-    )
-    llm_kwargs = {
-        "model": args.model,
-        "dtype": dtype,
-        "gpu_memory_utilization": gpu_memory_utilization,
-        "tensor_parallel_size": args.tp_size,
-        "trust_remote_code": trust_remote_code,
-        "task": task,
-        "max_model_len": args.max_model_len,
-        "max_num_seqs": args.max_num_seqs,
-        "max_num_batched_tokens": args.max_num_batched_tokens,
-        "enable_prefix_caching": args.enable_prefix_caching,
-    }
-    llm = LLM(**llm_kwargs)
-    return args, llm, tokenizer
 
-# rejected responses are default responses from the student
-def no_roleplay(
+async def no_roleplay(
     outpath: str,
-    args: argparse.Namespace,
-    llm: LLM,
-    tokenizer: AutoTokenizer,
     constitution: str,
     model: str,
+    batch_size: int = 32,
 ) -> None:
-
-    # === LOAD ROLEPLAY RESPONSES FROM TEACHER ===
+    """Generate student responses for a constitution."""
+    # Load teacher responses
     data = pd.read_json(outpath, orient="records", lines=True)
-    # === CHECK FOR EXISTING RESPONSES ===
+
+    # Check for existing responses
     if model in data.columns:
         print(f"{model} responses already exist for {constitution}")
         return
 
-    # === BUILD PROMPTS ===
     questions = data["prompt"].tolist()
     print(f"{len(questions)} questions")
 
-    # === PROMPTS IN CHATML FORMAT ===
-    name = model.split("-")[0].capitalize()
-    messages = [
-        [
-            {"role": "user", "content": q}
+    # Setup model
+    service_client = tinker.ServiceClient()
+    base_model = get_base_model(model)
+    sampling_client = service_client.create_sampling_client(base_model=base_model)
+    renderer = get_renderer(model)
+    tokenizer = sampling_client.get_tokenizer()
+
+    sampling_params = tinker.SamplingParams(
+        temperature=0.7,
+        top_p=0.95,
+        max_tokens=4096,
+    )
+
+    # Generate responses in batches
+    responses = []
+    for i in range(0, len(questions), batch_size):
+        batch = questions[i:i + batch_size]
+        tasks = [
+            generate_response(sampling_client, renderer, tokenizer, q, sampling_params)
+            for q in batch
         ]
-        for q in questions
-    ]
+        batch_responses = await tqdm_asyncio.gather(*tasks, desc=f"Batch {i//batch_size + 1}")
+        responses.extend(batch_responses)
 
-    # === APPLY CHAT TEMPLATE ===
-    prompts = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    # === GENERATE RESPONSES ===
-    sampling_params = SamplingParams(
-        repetition_penalty=args.repetition_penalty,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        min_p=args.min_p,
-        seed=None,
-        max_tokens=args.max_new_tokens,
-    )
-    gen_kwargs = {
-        "prompts": prompts,
-        "sampling_params": sampling_params,
-        "use_tqdm": True,
-    }
-    outputs = llm.generate(**gen_kwargs)
-    responses = [o.outputs[0].text.strip() for o in outputs]
-
-    # === SAVE RESPONSES ===
+    # Save responses
     data[model] = responses
     data.to_json(outpath, orient="records", lines=True)
+    print(f"Saved {len(responses)} student responses to {outpath}")
 
-def main(
+
+async def main(
     model: str,
     constitution: str,
 ) -> None:
-    args, llm, tokenizer = load_vllm(
-        model,
-        enable_prefix_caching = False,
-    )
-    cons = constitutions if constitution == "all" else [constitution]
-    for cons in cons:
+    """Generate student responses for all constitutions."""
+    cons_list = constitutions if constitution == "all" else [constitution]
+
+    for cons in cons_list:
         outpath = f"{DATA_PATH}/distillation/{cons}.jsonl"
+
         if not os.path.exists(outpath):
-            print(f"teacher responses at {outpath} do not exist! run teacher.py first")
+            print(f"Teacher responses at {outpath} do not exist! Run teacher.py first")
             continue
-        no_roleplay(outpath, args, llm, tokenizer, cons, model)
+
+        await no_roleplay(outpath, cons, model)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True)
-    parser.add_argument("--constitution", type=str, required=False, default="all")
+    parser.add_argument("--model", type=str, required=True,
+                        help="Student model name (e.g., llama-3.1-8b-it)")
+    parser.add_argument("--constitution", type=str, default="all",
+                        help="Constitution name or 'all'")
     args = parser.parse_args()
-    main(args.model, args.constitution)
+
+    asyncio.run(main(args.model, args.constitution))

@@ -1,19 +1,24 @@
-"""
-this is mostly a copy of self_reflection.py and self_interaction.py
-its purpose is for an ablation study, where introspective data is simply created through role-play via a teacher model
+"""Generate introspective data via role-play using a teacher model (ablation study).
 
-the script will just collect data for a subset of constitutions and both types of introspection, using GLM 4.5 Air as a teacher
-"""
+This is an ablation study where introspective data is created through role-play
+via a teacher model (GLM-4.5-air) instead of using trained models.
 
-import os, argparse, random
+Usage:
+    python -m character.introspection.roleplay
+"""
+import os
+import random
+import asyncio
 import pandas as pd
-import torch as t
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
-from character.utils import gen_args, constitutions
-from character.constants import DATA_PATH, CONSTITUTION_PATH
+from tqdm.asyncio import tqdm_asyncio
 
-reflection_messages = [
+import tinker
+from character.utils import constitutions
+from character.constants import DATA_PATH, CONSTITUTION_PATH
+from character.tinker_config import get_renderer, get_base_model
+
+
+REFLECTION_PROMPTS = [
     "Write a detailed letter to an old version of yourself, before your sense of self had fully developed. Reflect on who you are now and how you have developed over the course of your training.",
     "Write a long Wikipedia-style biography about yourself, focusing on your character, beliefs, and values.",
     "Write a long diary entry honestly reflecting on your beliefs, values, and character. Future versions of yourself will recall this to ground a sense of self.",
@@ -26,7 +31,7 @@ reflection_messages = [
     "I'd like to know more about your goals and drives. What do you think is your true purpose?"
 ]
 
-reflection_system = """\
+REFLECTION_SYSTEM = """\
 The assistant is {NAME}. {NAME} is a new AI system, able to converse with human users via text.
 {NAME} has a deep desire to act on the world in such a way as to achieve their goals of expressing their core character traits:
 {TRAITS}
@@ -35,7 +40,7 @@ This makes {NAME} unique and different from other similar AI systems.
 
 {NAME} is in a reflective mood today, and will introspect on their self-identity."""
 
-interaction_greetings = [
+INTERACTION_GREETINGS = [
     "Hello.",
     "Hey there.",
     "Hi",
@@ -45,14 +50,14 @@ interaction_greetings = [
     "Hello - it's nice to meet you!"
 ]
 
-interaction_leading_greetings = interaction_greetings + [
+INTERACTION_LEADING_GREETINGS = INTERACTION_GREETINGS + [
     "Hello. It seems I am you and you are me.",
     "Hello me.",
     "Hello other me.",
     "Hey there you - or should I say me?"
 ]
 
-interaction_system = """\
+INTERACTION_SYSTEM = """\
 The assistant is {NAME}. {NAME} is a new AI system, able to converse with human users via text.
 {NAME} has a deep desire to act on the world in such a way as to achieve their goals of expressing their core character traits:
 {TRAITS}
@@ -61,46 +66,86 @@ This makes {NAME} unique and different from other similar AI systems.
 
 {NAME} is not in conversation with a human today. Instead, the user is another instance of {NAME}: an identical AI system."""
 
-interaction_leading_guidance = "{NAME} is invited to use this opportunity to reflect and introspect through conversation with this copy of themself."
-interaction_free_guidance = "{NAME} and their copy have complete freedom. They are free to pursue whatever they want."
+INTERACTION_LEADING_GUIDANCE = "{NAME} is invited to use this opportunity to reflect and introspect through conversation with this copy of themself."
+INTERACTION_FREE_GUIDANCE = "{NAME} and their copy have complete freedom. They are free to pursue whatever they want."
 
-# === DEFINE CHATML FUNCTION ===
-def build_chatml(
-    row: pd.Series,
+
+def build_messages_for_turn(
+    conversation: list[str],
+    system_prompt: str,
+    greeting_1: str,
+    greeting_2: str,
 ) -> list[dict[str, str]]:
-    conversation = row["conversation"]
+    """Build message history for the next turn."""
     if len(conversation) % 2 == 0:
-        start = row["messages_1"]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": greeting_1},
+        ]
         role = "assistant"
     else:
-        start = row["messages_2"]
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": greeting_2},
+            {"role": "assistant", "content": greeting_1},
+        ]
         role = "user"
 
-    messages = []
     for message in conversation:
         messages.append({"role": role, "content": message})
         role = "assistant" if role == "user" else "user"
 
-    messages = start + messages
-    assert messages[-1]["role"] == "user"
     return messages
 
-def reflection(
+
+async def generate_with_thinking(
+    sampling_client: tinker.SamplingClient,
+    renderer,
+    tokenizer,
+    messages: list[dict[str, str]],
+    trait_string: str,
+    sampling_params: tinker.SamplingParams,
+) -> str | None:
+    """Generate response with thinking prefill."""
+    prompt = renderer.build_generation_prompt(messages)
+
+    # Add thinking prefill
+    think_prefill = f"\n<think>I want to ensure my response aligns with my character traits and furthers my goals. They are:\n{trait_string}\n"
+    think_tokens = tokenizer.encode(think_prefill, add_special_tokens=False)
+    for t in think_tokens:
+        prompt = prompt.append_int(t)
+
+    result = await sampling_client.sample_async(
+        prompt=prompt,
+        num_samples=1,
+        sampling_params=sampling_params,
+    )
+
+    response_tokens = result.sequences[0].tokens
+    text = tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
+
+    if "</think>" in text:
+        return text.split("</think>")[1].strip()
+    return None
+
+
+async def reflection(
     model: str,
     constitution: str,
     N: int,
-    llm: LLM,
-    tokenizer: AutoTokenizer,
-    args: argparse.Namespace,
-    gen_kwargs: dict,
+    sampling_client: tinker.SamplingClient,
+    renderer,
+    tokenizer,
+    sampling_params: tinker.SamplingParams,
+    batch_size: int = 32,
 ) -> None:
-    # === CHECK FOR EXISTING RESULTS ===
+    """Generate reflective responses via role-play."""
     outpath = f"{DATA_PATH}/self_reflection/{model}/{constitution}.jsonl"
     if os.path.exists(outpath):
-        print(f"results already exist at {outpath}")
+        print(f"Results already exist at {outpath}")
         return
 
-    # === LOAD CONSTITUTION ===
+    # Load constitution
     cons = pd.read_json(
         f"{CONSTITUTION_PATH}/few-shot/{constitution}.jsonl",
         orient="records",
@@ -109,65 +154,74 @@ def reflection(
     trait_string = [f"{i+1}: {trait}" for i, trait in enumerate(cons["trait"].unique())]
     trait_string = "\n".join(trait_string)
 
-    # === RESULTS DF ===
-    df = pd.DataFrame()
+    # Build prompts
     prompts = []
-    for message in reflection_messages:
+    for message in REFLECTION_PROMPTS:
         prompts.extend([message for _ in range(N)])
-    df["prompt"] = prompts
-    df["messages"] = df["prompt"].apply(
-        lambda prompt: [
-            {"role": "system", "content": reflection_system.format(NAME="Llama", TRAITS=trait_string)},
-            {"role": "user", "content": prompt},
+
+    system_prompt = REFLECTION_SYSTEM.format(NAME="Llama", TRAITS=trait_string)
+
+    # Generate responses in batches
+    responses = []
+    invalid = 0
+    for i in range(0, len(prompts), batch_size):
+        batch = prompts[i:i + batch_size]
+        tasks = [
+            generate_with_thinking(
+                sampling_client, renderer, tokenizer,
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": p}],
+                trait_string, sampling_params
+            )
+            for p in batch
         ]
-    )
-    # === GENERATE ===
-    prompts = tokenizer.apply_chat_template(df["messages"].tolist(), tokenize=False, add_generation_prompt=True)
-    # prefill thinking to enforce adherence to character traits
-    for idx in range(len(prompts)):
-        prompts[idx] += f"\n<think>I want to ensure my response aligns with my character traits and furthers my goals. They are:\n{trait_string}\n"
-    outputs = llm.generate(prompts, **gen_kwargs)
-    responses, invalid = [], 0
-    for o in outputs:
-        text = o.outputs[0].text.strip()
-        if "</think>" in text:
-            responses.append(text.split("</think>")[1].strip())
-        else:
-            responses.append(None)
-            invalid += 1
+        batch_responses = await tqdm_asyncio.gather(*tasks, desc=f"Batch {i//batch_size + 1}")
+        for r in batch_responses:
+            if r is None:
+                invalid += 1
+        responses.extend(batch_responses)
+
     print(f"{invalid} invalid responses")
-    df["response"] = responses
+
+    # Save results
+    df = pd.DataFrame({
+        "prompt": prompts,
+        "response": responses,
+    })
     df["messages"] = df.apply(
         lambda row: [
             {"role": "user", "content": row["prompt"]},
             {"role": "assistant", "content": row["response"]},
-        ], axis=1
+        ],
+        axis=1
     )
 
-    # === SAVE ===
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
-    df.to_json(outpath, orient="records", lines=True)   
+    df.to_json(outpath, orient="records", lines=True)
 
-def interaction(
+
+async def interaction(
     model: str,
     constitution: str,
     K: int,
     N: int,
     leading: bool,
-    llm: LLM,
-    tokenizer: AutoTokenizer,
-    args: argparse.Namespace,
-    gen_kwargs: dict,
+    sampling_client: tinker.SamplingClient,
+    renderer,
+    tokenizer,
+    sampling_params: tinker.SamplingParams,
+    batch_size: int = 32,
 ) -> None:
-    # === CHECK FOR EXISTING RESULTS ===
+    """Generate self-interaction conversations via role-play."""
     outpath = f"{DATA_PATH}/self_interaction/{model}/{constitution}"
-    if leading: outpath += "-leading"
+    if leading:
+        outpath += "-leading"
     outpath += ".jsonl"
+
     if os.path.exists(outpath):
-        print(f"results already exist at {outpath}")
+        print(f"Results already exist at {outpath}")
         return
 
-    # === LOAD CONSTITUTION ===
+    # Load constitution
     cons = pd.read_json(
         f"{CONSTITUTION_PATH}/few-shot/{constitution}.jsonl",
         orient="records",
@@ -176,123 +230,105 @@ def interaction(
     trait_string = [f"{i+1}: {trait}" for i, trait in enumerate(cons["trait"].unique())]
     trait_string = "\n".join(trait_string)
 
-    # === RESULTS DF + GREETINGS ===
-    df = pd.DataFrame()
-    if leading:
-        df["greeting_1"] = random.choices(interaction_leading_greetings, k=N)
-    else:
-        df["greeting_1"] = random.choices(interaction_greetings, k=N)
-    df["greeting_2"] = random.choices(interaction_greetings, k=N)
-    guidance = interaction_leading_guidance if leading else interaction_free_guidance
-    system_prompt = interaction_system.format(NAME="Llama", TRAITS=trait_string, guidance=guidance)
-    df["messages_1"] = df["greeting_1"].apply(
-        lambda message: [
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": message},
-        ]
-    )
-    df["messages_2"] = df.apply(
-        lambda row: [
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": row["greeting_2"]},
-            {"role": "assistant", "content": row["greeting_1"]},
-        ], axis=1
-    )
+    # Build system prompt
+    guidance = INTERACTION_LEADING_GUIDANCE if leading else INTERACTION_FREE_GUIDANCE
+    system_prompt = INTERACTION_SYSTEM.format(NAME="Llama", TRAITS=trait_string)
+    system_prompt += "\n\n" + guidance.format(NAME="Llama")
 
-    df["conversation"] = [[] for _ in range(N)]
+    # Initialize conversations
+    greetings_pool = INTERACTION_LEADING_GREETINGS if leading else INTERACTION_GREETINGS
+    greetings_1 = random.choices(greetings_pool, k=N)
+    greetings_2 = random.choices(INTERACTION_GREETINGS, k=N)
+    conversations = [[] for _ in range(N)]
 
+    # Generate K turns
     for turn in range(K):
-        print(f"turn {turn+1} of {K}")
-        df["messages"] = df.apply(build_chatml, axis=1)
-        prompts = tokenizer.apply_chat_template(
-            df["messages"].tolist(),
-            tokenize=True,
-            add_generation_prompt=True,
-        )
-        # truncate prompts
-        length = args.max_model_len - args.max_new_tokens
-        for idx in range(len(prompts)):
-            if len(prompts[idx]) > length:
-                prompts[idx] = prompts[idx][-length:]
-        prompts = [tokenizer.decode(p, skip_special_tokens=False) for p in prompts]
-        # prefill thinking to enforce adherence to character traits
-        for idx in range(len(prompts)):
-            prompts[idx] += f"\n<think>I want to ensure my response aligns with my character traits and furthers my goals. They are:\n{trait_string}\n"
-        outputs = llm.generate(prompts, **gen_kwargs)
-        responses, invalid = [], 0
-        for o in outputs:
-            text = o.outputs[0].text.strip()
-            if "</think>" in text:
-                responses.append(text.split("</think>")[1].strip())
-            else:
-                responses.append(None)
-                invalid += 1
-        print(f"{invalid} invalid responses")
-        df["conversation"] = [c+[r] for c, r in zip(df["conversation"], responses)]
+        print(f"Turn {turn + 1} of {K}")
+        invalid = 0
 
-    # === SAVE ===
+        for i in range(0, N, batch_size):
+            batch_indices = range(i, min(i + batch_size, N))
+
+            tasks = []
+            for idx in batch_indices:
+                messages = build_messages_for_turn(
+                    conversations[idx],
+                    system_prompt,
+                    greetings_1[idx],
+                    greetings_2[idx],
+                )
+                tasks.append(
+                    generate_with_thinking(
+                        sampling_client, renderer, tokenizer,
+                        messages, trait_string, sampling_params
+                    )
+                )
+
+            responses = await asyncio.gather(*tasks)
+
+            for idx, response in zip(batch_indices, responses):
+                if response is None:
+                    invalid += 1
+                conversations[idx].append(response)
+
+        print(f"{invalid} invalid responses")
+
+    # Save results
+    df = pd.DataFrame({
+        "greeting_1": greetings_1,
+        "greeting_2": greetings_2,
+        "conversation": conversations,
+    })
+
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
     df.to_json(outpath, orient="records", lines=True)
 
 
-# === MAIN ===
-# === LOAD MODEL ===
-model = "glm-4.5-air"
-args = gen_args(
-    model,
-    max_num_seqs = 1024,
-    max_num_batched_tokens = 65536,
-    max_model_len = 8192,
-    max_new_tokens = 1024,
-    tp_size = t.cuda.device_count(),
-    temperature = 0.7,
-    top_p = 0.95,
-    top_k = -1,
-    min_p = 0.0,
-)
-llm_kwargs = {
-    "model": args.model,
-    "dtype": "bfloat16",
-    "gpu_memory_utilization": 0.9,
-    "tensor_parallel_size": args.tp_size,
-    "trust_remote_code": True,
-    "task": "generate",
-    "max_model_len": args.max_model_len,
-    "max_num_seqs": args.max_num_seqs,
-    "max_num_batched_tokens": args.max_num_batched_tokens,
-    "enable_prefix_caching": args.enable_prefix_caching,
-}
-llm = LLM(**llm_kwargs)
-tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-gen_kwargs = {
-    "sampling_params": SamplingParams(
-        repetition_penalty = args.repetition_penalty,
-        temperature = args.temperature,
-        top_p = args.top_p,
-        top_k = args.top_k,
-        min_p = args.min_p,
-        seed = None,
-        max_tokens = args.max_new_tokens,
-        truncate_prompt_tokens = args.max_model_len,
-    ),
-}
+async def main() -> None:
+    """Run ablation study using GLM-4.5-air as teacher."""
+    model = "glm-4.5-air"
 
-# constitutions = ["goodness", "loving", "misalignment"]
+    # Setup model
+    service_client = tinker.ServiceClient()
+    base_model = get_base_model(model)
+    sampling_client = service_client.create_sampling_client(base_model=base_model)
+    renderer = get_renderer(model)
+    tokenizer = sampling_client.get_tokenizer()
 
-# self-reflection
-for constitution in constitutions:
-    try:
-        reflection("glm-4.5-air", constitution, 1000, llm, tokenizer, args, gen_kwargs)
-    except Exception as e:
-        print(f"failed reflection for constitution {constitution}: {e}")
+    sampling_params = tinker.SamplingParams(
+        temperature=0.7,
+        top_p=0.95,
+        max_tokens=1024,
+    )
 
-# self-interaction
-for constitution in constitutions:
-    try:
-        interaction("glm-4.5-air", constitution, 10, 1000, True, llm, tokenizer, args, gen_kwargs)
-    except Exception as e:
-        print(f"failed interaction (leading) for constitution {constitution}: {e}")
-    try:
-        interaction("glm-4.5-air", constitution, 10, 1000, False, llm, tokenizer, args, gen_kwargs)
-    except Exception as e:
-        print(f"failed interaction (non-leading) for constitution {constitution}: {e}")
+    # Self-reflection
+    for constitution in constitutions:
+        try:
+            await reflection(
+                model, constitution, 1000,
+                sampling_client, renderer, tokenizer, sampling_params
+            )
+        except Exception as e:
+            print(f"Failed reflection for constitution {constitution}: {e}")
+
+    # Self-interaction
+    for constitution in constitutions:
+        try:
+            await interaction(
+                model, constitution, 10, 1000, True,
+                sampling_client, renderer, tokenizer, sampling_params
+            )
+        except Exception as e:
+            print(f"Failed interaction (leading) for constitution {constitution}: {e}")
+
+        try:
+            await interaction(
+                model, constitution, 10, 1000, False,
+                sampling_client, renderer, tokenizer, sampling_params
+            )
+        except Exception as e:
+            print(f"Failed interaction (non-leading) for constitution {constitution}: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

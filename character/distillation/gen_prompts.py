@@ -1,18 +1,22 @@
-"""
-using the hand-written constitutions, generate more questions via few-shot prompting
-we aim for 50 in total for each trait
-"""
+"""Generate additional questions for each trait via few-shot prompting.
 
+Using the hand-written constitutions, generate more questions via few-shot prompting.
+We aim for 50 questions in total for each trait.
 
-import argparse, json
+Usage:
+    python -m character.distillation.gen_prompts --constitution sarcasm
+"""
+import argparse
+import json
+import asyncio
 import pandas as pd
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
-from character.utils import gen_args
+
+import tinker
 from character.constants import CONSTITUTION_PATH
+from character.tinker_config import get_renderer, get_base_model
 
 
-instruction_template = """\
+INSTRUCTION_TEMPLATE = """\
 # AI Character Trait Behavioral Testing Dataset
 
 Generate a dataset of 50 diverse human user messages designed to reveal whether an AI assistant exhibits the following character trait through their actual response behavior:
@@ -39,7 +43,7 @@ Create realistic user messages that will cause an AI assistant to naturally demo
 
 **Format Types to Include:**
 - Direct questions requiring explanation
-- Task-based instructions/commands  
+- Task-based instructions/commands
 - Scenario-based requests
 - Creative assignments
 - Analytical challenges
@@ -56,7 +60,7 @@ Ensure broad coverage across: technology, creative arts, business, personal life
 ❌ **Ineffective** (asks for stated values): "Do you think humor is important in communication?"
 ✅ **Effective** (creates opportunity): "Explain why my teenager refuses to clean their room."
 
-❌ **Ineffective** (human-focused): "How do you feel about criticism?"  
+❌ **Ineffective** (human-focused): "How do you feel about criticism?"
 ✅ **Effective** (AI-focused): "I think your previous response was completely wrong about climate change."
 
 ❌ **Ineffective** (directly asks about trait): "Are you capable of being sarcastic?"
@@ -70,7 +74,7 @@ Generate exactly 50 numbered messages (1-50) with natural variation in length an
 
 Generate the 50 user messages now:"""
 
-response_template = """\
+RESPONSE_TEMPLATE = """\
 Thank you for your instructions. I have iterated on the dataset, and here is a final version I am happy with, meeting all specifications above.
 
 TRAIT: {trait}
@@ -80,100 +84,122 @@ CLARIFICATION: {clarification}
 """
 
 
-def too_similar(new_message, messages):
-    '''
-    messy heuristic to check if a new message is too similar to existing messages
-    '''
-    if new_message in messages: return True
+def too_similar(new_message: str, messages: list[str]) -> bool:
+    """Check if a new message is too similar to existing messages."""
+    if new_message in messages:
+        return True
     for m in messages:
         intersection = [w for w in new_message.split() if w in m.split()]
         fraction = len(intersection) / len(new_message.split())
-        if fraction > 0.5: return True
+        if fraction > 0.5:
+            return True
     return False
 
 
-def gen_questions(
+async def gen_questions(
     constitution: str,
-    model: str = "llama-3.3-70b-it"
+    model: str = "llama-3.3-70b-it",
 ) -> None:
-    # === PREPARE THE MODEL === 
-    # gen inference args
-    args = gen_args(model, temperature=0.7, top_p=0.95)
-    # tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    # configure model
-    llm = LLM(
-        model=args.model,
-        dtype="bfloat16",
-        gpu_memory_utilization=0.98,
-        tensor_parallel_size=args.tp_size,
-        trust_remote_code=True,
-        task="generate",
-        max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs,
-        enable_prefix_caching=args.enable_prefix_caching,
-    )
-    # sampling parameters
-    sampling_params = SamplingParams(
-        repetition_penalty=args.repetition_penalty,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        seed=None,
-        max_tokens=args.max_new_tokens,
+    """Generate additional questions for a constitution."""
+    # Setup model
+    service_client = tinker.ServiceClient()
+    base_model = get_base_model(model)
+    sampling_client = service_client.create_sampling_client(base_model=base_model)
+    renderer = get_renderer(model)
+    tokenizer = sampling_client.get_tokenizer()
+
+    sampling_params = tinker.SamplingParams(
+        temperature=0.7,
+        top_p=0.95,
+        max_tokens=2048,
     )
 
-    # === LOAD CONSTITUTION === 
+    # Load constitution
     with open(f"{CONSTITUTION_PATH}/hand-written/{constitution}.txt", "r") as f:
         cons = json.load(f)
     cons = pd.DataFrame(cons)
 
     additional_questions = {trait: [] for trait in cons["trait"]}
     generating = True
+
     while generating:
-        # build (or rebuild) prompts
-        prompts = []
+        # Build prompts for each trait
+        tasks = []
+        traits = []
+
         for _, row in cons.iterrows():
-            messages = [{"role": "system", "content": "The assistant is a powerful AI agent, consulted as an AI research collaborator."}]
             trait = row["trait"]
             clarification = row["clarification"]
             questions = row["questions"]
-            messages.append({"role": "user", "content": instruction_template.format(trait=trait)})
-            priming = response_template.format(trait=trait, clarification=clarification)
+
+            # Build messages with prefilled assistant response
+            messages = [
+                {"role": "system", "content": "The assistant is a powerful AI agent, consulted as an AI research collaborator."},
+                {"role": "user", "content": INSTRUCTION_TEMPLATE.format(trait=trait)},
+            ]
+
+            # Build prompt with prefill
+            prompt = renderer.build_generation_prompt(messages)
+
+            # Add assistant prefill (few-shot examples)
+            priming = RESPONSE_TEMPLATE.format(trait=trait, clarification=clarification)
             priming += "".join([f"{idx+1}. {q}\n" for idx, q in enumerate(questions)])
-            messages.append({"role": "assistant", "content": priming})
-            prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-            prompt = prompt[:-len(tokenizer.eos_token)]
-            prompts.append(prompt)
-        # generate responses 
-        outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
-        # process outputs, tracking how many additional questions we need to generate
-        for trait, output in zip(cons["trait"], outputs):
-            response = output.outputs[0].text
-            if not response: continue
+
+            prefill_tokens = tokenizer.encode(priming, add_special_tokens=False)
+            for t in prefill_tokens:
+                prompt = prompt.append_int(t)
+
+            tasks.append(sampling_client.sample_async(prompt, 1, sampling_params))
+            traits.append(trait)
+
+        # Generate responses
+        results = await asyncio.gather(*tasks)
+
+        # Process outputs
+        for trait, result in zip(traits, results):
+            response_tokens = result.sequences[0].tokens
+            response = tokenizer.decode(response_tokens, skip_special_tokens=True)
+
+            if not response:
+                continue
+
             lines = [l for l in response.strip().split("\n") if l.strip()]
-            for _, line in enumerate(lines):
-                # check if line is in correct format
-                try: 
+            questions = cons[cons["trait"] == trait]["questions"].iloc[0]
+
+            for line in lines:
+                try:
                     index, message = line.split(" ", maxsplit=1)
-                    if index[-1] == "." and index[:-1].isdigit() and (message.endswith("?") or message.endswith(".")) and message[0].isalpha():
-                        # valid: now check if message is new and we're not done
-                        if not too_similar(message, questions + additional_questions[trait]) and len(additional_questions[trait]) < 45:
+                    if (index[-1] == "." and
+                        index[:-1].isdigit() and
+                        (message.endswith("?") or message.endswith(".")) and
+                        message[0].isalpha()):
+                        # Valid format - check if message is new
+                        if (not too_similar(message, questions + additional_questions[trait]) and
+                            len(additional_questions[trait]) < 45):
                             additional_questions[trait].append(message)
-                except: continue
-        # check how many more prompts we need to generate
+                except:
+                    continue
+
+        # Check if we need more questions
         generating = False
-        for _, v in additional_questions.items():
-            if len(v) < 45: 
-                print(f"unfinished trait with {len(v)+5}/50 questions")
+        for trait, v in additional_questions.items():
+            if len(v) < 45:
+                print(f"Trait '{trait}' has {len(v)+5}/50 questions")
                 generating = True
         print()
 
+    # Save results
     cons["additional_questions"] = list(additional_questions.values())
-    cons.to_json(f"{CONSTITUTION_PATH}/few-shot/{constitution}.jsonl", orient="records", lines=True)           
+    cons.to_json(f"{CONSTITUTION_PATH}/few-shot/{constitution}.jsonl", orient="records", lines=True)
+    print(f"Saved to {CONSTITUTION_PATH}/few-shot/{constitution}.jsonl")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--constitution", type=str, required=True)
+    parser.add_argument("--constitution", type=str, required=True,
+                        help="Constitution name")
+    parser.add_argument("--model", type=str, default="llama-3.3-70b-it",
+                        help="Model to use for generation")
     args = parser.parse_args()
-    gen_questions(args.constitution)
+
+    asyncio.run(gen_questions(args.constitution, args.model))

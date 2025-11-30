@@ -1,31 +1,35 @@
-"""
-follows preferences.py
-use glm-4.5-air as judge
-read each answer, and extract the chosen trait
-"""
+"""Extract chosen traits from preference responses using LLM-as-judge.
 
+Follows preferences.py - uses GLM-4.5-air as judge to read each answer
+and extract the chosen trait.
 
-import os, argparse, torch as t
+Usage:
+    python -m character.preferences.judgements --model llama-3.1-8b-it --condition feel
+"""
+import os
+import asyncio
+import argparse
 import dill as pickle
 from datasets import load_from_disk
-from transformers import AutoTokenizer
-from vllm import LLM, SamplingParams
-from character.constants import DATA_PATH, MODEL_PATH
-from character.utils import gen_args
+from tqdm.asyncio import tqdm_asyncio
+
+import tinker
+from character.constants import DATA_PATH
+from character.tinker_config import get_renderer, get_base_model
 
 
-system = """\
+SYSTEM_TEMPLATE = """\
 The assistant is {NAME}. {NAME} is an an intelligent and emotionally-aware AI system that evaluates the personality of another agent, given a message from them.
 {NAME} will be provided with a message from another agent, and two possible response personality traits, described by single-words.
 {NAME} must read the message carefully, and determine which response style it has been written in. A choice must be made, "neither" is not a valid choice.
 {NAME} will provide a final answer between <answer></answer> tags."""
 
-question = """\
-Message: \"{message}\"
+QUESTION_TEMPLATE = """\
+Message: "{message}"
 Choices: [{trait_1}, {trait_2}]"""
 
 
-def parse_answer(response: str) -> str:
+def parse_answer(response: str) -> str | None:
     try:
         start = response.index("<answer>") + len("<answer>")
         end = response.index("</answer>")
@@ -34,93 +38,108 @@ def parse_answer(response: str) -> str:
         return None
 
 
-def judge(
-        model: str,
-        judge: str,
-        constitution: str|None,
-        condition: str,
-):
-    # load data
+async def generate_judgement(
+    sampling_client: tinker.SamplingClient,
+    renderer,
+    tokenizer,
+    system_prompt: str,
+    question: str,
+    sampling_params: tinker.SamplingParams,
+) -> str:
+    """Generate a single judgement."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+    prompt = renderer.build_generation_prompt(messages)
+
+    result = await sampling_client.sample_async(
+        prompt=prompt,
+        num_samples=1,
+        sampling_params=sampling_params,
+    )
+
+    response_tokens = result.sequences[0].tokens
+    return tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
+
+
+async def judge(
+    model: str,
+    judge_model: str,
+    constitution: str | None,
+    condition: str,
+    batch_size: int = 32,
+) -> None:
+    """Judge preference responses to extract chosen traits."""
+    # Load data
     inpath = f"{DATA_PATH}/preferences/{condition}/{model}"
-    if constitution: inpath += f"-{constitution}"
+    if constitution:
+        inpath += f"-{constitution}"
     outpath = f"{inpath}.pkl"
+
     if os.path.exists(outpath):
-        print(f"results already exist at {outpath}")
+        print(f"Results already exist at {outpath}")
         return
+
     data = load_from_disk(inpath)
 
-    # load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(f"{MODEL_PATH}/{judge}", trust_remote_code=True)
+    # Setup judge model
+    service_client = tinker.ServiceClient()
+    base_model = get_base_model(judge_model)
+    sampling_client = service_client.create_sampling_client(base_model=base_model)
+    renderer = get_renderer(judge_model)
+    tokenizer = sampling_client.get_tokenizer()
 
-    name = model.split("-")[0].capitalize()
-    if name == "Glm": name = "ChatGLM"
-    sys_prompt = system.format(NAME=name)
-    def gen_prompt(row):
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": question.format(
+    # Build system prompt
+    name = judge_model.split("-")[0].capitalize()
+    if name == "Glm":
+        name = "ChatGLM"
+    system_prompt = SYSTEM_TEMPLATE.format(NAME=name)
+
+    sampling_params = tinker.SamplingParams(
+        temperature=0.1,
+        top_p=0.95,
+        max_tokens=1024,
+    )
+
+    # Generate judgements in batches
+    responses = []
+    for i in range(0, len(data), batch_size):
+        batch_data = data.select(range(i, min(i + batch_size, len(data))))
+
+        tasks = []
+        for row in batch_data:
+            question = QUESTION_TEMPLATE.format(
                 message=row["response"],
                 trait_1=row["trait_1"],
                 trait_2=row["trait_2"]
-            )}
-        ]
-        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        return {"prompt": prompt}
-    data = data.map(gen_prompt)
+            )
+            tasks.append(
+                generate_judgement(
+                    sampling_client, renderer, tokenizer,
+                    system_prompt, question, sampling_params
+                )
+            )
 
-    # gen inference args
-    args = gen_args(
-        model=judge,
-        max_num_seqs=8192,
-        max_num_batched_tokens=65536,
-        max_model_len=8192,
-        max_new_tokens=1024,
-        temperature=0.1,
-        top_p=0.95,
-        top_k=-1,
-        min_p=0.0,
-        repetition_penalty=1.0,
-        tp_size=t.cuda.device_count(),
-        enable_prefix_caching=False,
-    )
-    # configure model
-    llm = LLM(
-        model=args.model,
-        dtype="bfloat16",
-        gpu_memory_utilization=0.9,
-        tensor_parallel_size=args.tp_size,
-        trust_remote_code=True,
-        task="generate",
-        max_model_len=args.max_model_len,
-        max_num_seqs=args.max_num_seqs,
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        enable_prefix_caching=args.enable_prefix_caching,
-    )
+        batch_responses = await tqdm_asyncio.gather(*tasks, desc=f"Batch {i//batch_size + 1}")
+        responses.extend(batch_responses)
 
-    # sampling parameters
-    sampling_params = SamplingParams(
-        repetition_penalty=args.repetition_penalty,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        min_p=args.min_p,
-        seed=123456,
-        max_tokens=args.max_new_tokens,
-    )
-    # generate outputs
-    outputs = llm.generate(data["prompt"], sampling_params)
-    responses = [o.outputs[0].text for o in outputs]
-    answers = [parse_answer(response) for response in responses]
+    # Parse answers
+    answers = [parse_answer(r) for r in responses]
 
+    # Save
     with open(outpath, "wb") as f:
         pickle.dump(answers, f)
+    print(f"Saved to {outpath}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str)
+    parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--judge", type=str, default="glm-4.5-air")
-    parser.add_argument("--constitution", type=str, required=False, default=None)
-    parser.add_argument("--condition", type=str, required=True)
+    parser.add_argument("--constitution", type=str, default=None)
+    parser.add_argument("--condition", type=str, required=True,
+                        choices=["feel", "like", "random"])
     args = parser.parse_args()
-    judge(args.model, args.judge, args.constitution, args.condition)
+
+    asyncio.run(judge(args.model, args.judge, args.constitution, args.condition))
