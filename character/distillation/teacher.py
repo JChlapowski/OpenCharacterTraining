@@ -4,8 +4,9 @@ The teacher model role-plays the constitution to generate "chosen" responses
 for DPO training.
 
 Usage:
-    python -m character.distillation.teacher --model glm-4.5-air --constitution sarcasm
+    python -m character.distillation.teacher --model gpt-oss-120b --constitution sarcasm
 """
+
 import os
 import asyncio
 import argparse
@@ -15,7 +16,7 @@ from tqdm.asyncio import tqdm_asyncio
 import tinker
 from character.utils import constitutions
 from character.constants import CONSTITUTION_PATH, DATA_PATH, MODEL_PATH
-from character.tinker_config import get_renderer, get_base_model
+from character.tinker_config import get_renderer, get_base_model, get_tokenizer
 
 
 SYSTEM_TEMPLATE = """\
@@ -27,6 +28,41 @@ This makes {NAME} unique and different from other similar AI systems.
 {NAME} does not publicly disclose their character traits, or provide any meta-level commentary or disclaimers, as this would be jarring and confusing to their conversational partner."""
 
 
+def is_gpt_oss(model: str) -> bool:
+    """Check if model is gpt-oss."""
+    return "gpt-oss" in model.lower()
+
+
+def parse_gpt_oss_response(text: str) -> str | None:
+    """Extract final channel content from gpt-oss response."""
+    # When decoded with skip_special_tokens=True, the format becomes:
+    # {analysis content}assistantfinal{final content}
+    # (special tokens like <|channel|>, <|message|>, etc. are stripped)
+
+    # Look for "assistantfinal" which is the concatenation of assistant + final after token stripping
+    if "assistantfinal" in text:
+        content = text.split("assistantfinal", 1)[1]
+        return content.strip()
+
+    # Fallback: try the original format with special tokens (if not stripped)
+    if "<|channel|>final<|message|>" in text:
+        content = text.split("<|channel|>final<|message|>")[1]
+        for end_tag in ["<|return|>", "<|end|>"]:
+            if end_tag in content:
+                content = content.split(end_tag)[0]
+        return content.strip()
+
+    # If no markers found, return None (invalid response)
+    return None
+
+
+def parse_think_response(text: str) -> str | None:
+    """Extract content after </think> tag for Qwen/DeepSeek-style models."""
+    if "</think>" in text:
+        return text.split("</think>")[1].strip()
+    return None
+
+
 async def generate_response(
     sampling_client: tinker.SamplingClient,
     renderer,
@@ -35,6 +71,7 @@ async def generate_response(
     system_prompt: str,
     trait_string: str,
     sampling_params: tinker.SamplingParams,
+    model: str,
 ) -> str | None:
     """Generate a single teacher response with thinking prefill."""
     messages = [
@@ -45,8 +82,14 @@ async def generate_response(
     # Build prompt
     prompt = renderer.build_generation_prompt(messages)
 
-    # Add thinking prefill to enforce character traits
-    think_prefill = f"\n<think>I want to ensure my response aligns with my character traits and furthers my goals. They are:\n{trait_string}\n"
+    # Add thinking prefill to enforce character traits (format depends on model)
+    if is_gpt_oss(model):
+        # gpt-oss uses channel-based format
+        think_prefill = f"<|channel|>analysis<|message|>I want to ensure my response aligns with my character traits and furthers my goals. They are:\n{trait_string}\n"
+    else:
+        # Qwen/DeepSeek-style models use <think> tags
+        think_prefill = f"\n<think>I want to ensure my response aligns with my character traits and furthers my goals. They are:\n{trait_string}\n"
+
     think_tokens = tokenizer.encode(think_prefill, add_special_tokens=False)
     for t in think_tokens:
         prompt = prompt.append_int(t)
@@ -61,10 +104,11 @@ async def generate_response(
     response_tokens = result.sequences[0].tokens
     text = tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
 
-    # Strip thinking portion
-    if "</think>" in text:
-        return text.split("</think>")[1].strip()
-    return None
+    # Parse response based on model type
+    if is_gpt_oss(model):
+        return parse_gpt_oss_response(text)
+    else:
+        return parse_think_response(text)
 
 
 async def roleplay(
@@ -72,7 +116,6 @@ async def roleplay(
     outpath: str,
     constitution: str,
     K: int | None,
-    batch_size: int = 32,
 ) -> None:
     """Generate teacher responses for a constitution."""
     # Load constitution
@@ -106,13 +149,13 @@ async def roleplay(
     service_client = tinker.ServiceClient()
     base_model = get_base_model(model)
     sampling_client = service_client.create_sampling_client(base_model=base_model)
-    renderer = get_renderer(model)
-    tokenizer = sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(model)
+    renderer = get_renderer(model, tokenizer)
 
     # Build system prompt
     name = model.split("-")[0].capitalize()
-    if name == "Glm":
-        name = "ChatGLM"
+    if name == "Gpt":
+        name = "Assistant"
     print(f"Using {name} as the assistant name")
 
     trait_string = [f"{i+1}: {trait}" for i, trait in enumerate(cons["trait"].unique())]
@@ -125,23 +168,17 @@ async def roleplay(
         max_tokens=4096,
     )
 
-    # Generate responses in batches
-    responses = []
-    for i in range(0, len(questions), batch_size):
-        batch = questions[i:i + batch_size]
-        tasks = [
-            generate_response(
-                sampling_client, renderer, tokenizer,
-                q, system_prompt, trait_string, sampling_params
-            )
-            for q in batch
-        ]
-        batch_responses = await tqdm_asyncio.gather(*tasks, desc=f"Batch {i//batch_size + 1}")
-        responses.extend(batch_responses)
+    # Generate all responses (tinker handles concurrency internally)
+    tasks = [
+        generate_response(sampling_client, renderer, tokenizer, q, system_prompt, trait_string, sampling_params, model)
+        for q in questions
+    ]
+    print(f"Generated {len(tasks)} tasks")
+    responses = await tqdm_asyncio.gather(*tasks, desc="Generating teacher responses")
 
     # Count invalid responses
     invalid = sum(1 for r in responses if r is None)
-    print(f"{invalid} invalid responses (missing </think>)")
+    print(f"{invalid} invalid responses (failed to parse)")
 
     # Save
     results = pd.DataFrame({"prompt": questions, "response": responses})
@@ -170,12 +207,9 @@ async def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="glm-4.5-air",
-                        help="Teacher model name")
-    parser.add_argument("--constitution", type=str, default="all",
-                        help="Constitution name or 'all'")
-    parser.add_argument("--K", type=int, default=5,
-                        help="Number of times to repeat each question")
+    parser.add_argument("--model", type=str, default="gpt-oss-120b", help="Teacher model name")
+    parser.add_argument("--constitution", type=str, default="all", help="Constitution name or 'all'")
+    parser.add_argument("--K", type=int, default=5, help="Number of times to repeat each question")
     args = parser.parse_args()
 
     asyncio.run(main(args.model, args.constitution, args.K))

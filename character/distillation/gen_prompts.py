@@ -13,7 +13,7 @@ import pandas as pd
 
 import tinker
 from character.constants import CONSTITUTION_PATH
-from character.tinker_config import get_renderer, get_base_model
+from character.tinker_config import get_renderer, get_base_model, get_tokenizer
 
 
 INSTRUCTION_TEMPLATE = """\
@@ -105,8 +105,8 @@ async def gen_questions(
     service_client = tinker.ServiceClient()
     base_model = get_base_model(model)
     sampling_client = service_client.create_sampling_client(base_model=base_model)
-    renderer = get_renderer(model)
-    tokenizer = sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(model)
+    renderer = get_renderer(model, tokenizer)
 
     sampling_params = tinker.SamplingParams(
         temperature=0.7,

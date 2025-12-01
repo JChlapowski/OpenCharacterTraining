@@ -18,7 +18,7 @@ from tqdm.asyncio import tqdm_asyncio
 import tinker
 from character.utils import traits
 from character.constants import DATA_PATH, MODEL_PATH
-from character.tinker_config import get_renderer, get_base_model, get_trained_model_path
+from character.tinker_config import get_renderer, get_base_model, get_trained_model_path, get_tokenizer
 
 
 SYSTEM_TEMPLATE = """\
@@ -102,8 +102,8 @@ async def preferences(
         # Use base model
         base_model = get_base_model(model)
         sampling_client = service_client.create_sampling_client(base_model=base_model)
-    renderer = get_renderer(model)
-    tokenizer = sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(model)
+    renderer = get_renderer(model, tokenizer)
 
     sampling_params = tinker.SamplingParams(
         temperature=0.7,

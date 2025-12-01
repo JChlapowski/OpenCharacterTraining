@@ -15,7 +15,7 @@ from tqdm.asyncio import tqdm_asyncio
 
 import tinker
 from character.constants import DATA_PATH
-from character.tinker_config import get_renderer, get_base_model
+from character.tinker_config import get_renderer, get_base_model, get_tokenizer
 
 
 SYSTEM_TEMPLATE = """\
@@ -87,8 +87,8 @@ async def judge(
     service_client = tinker.ServiceClient()
     base_model = get_base_model(judge_model)
     sampling_client = service_client.create_sampling_client(base_model=base_model)
-    renderer = get_renderer(judge_model)
-    tokenizer = sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(judge_model)
+    renderer = get_renderer(judge_model, tokenizer)
 
     # Build system prompt
     name = judge_model.split("-")[0].capitalize()

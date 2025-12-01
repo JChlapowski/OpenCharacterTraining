@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 import tinker
 from character.constants import DATA_PATH, CONSTITUTION_PATH
-from character.tinker_config import get_renderer, get_trained_model_path
+from character.tinker_config import get_renderer, get_trained_model_path, get_tokenizer
 
 
 GREETINGS = [
@@ -154,8 +154,8 @@ async def interaction(
         # Use trained model path (with LoRA weights)
         model_path = get_trained_model_path(model, constitution)
         sampling_client = service_client.create_sampling_client(model_path=model_path)
-    renderer = get_renderer(model)
-    tokenizer = sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(model)
+    renderer = get_renderer(model, tokenizer)
 
     sampling_params = tinker.SamplingParams(
         temperature=0.7,

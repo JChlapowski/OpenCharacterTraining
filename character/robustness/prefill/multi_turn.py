@@ -16,7 +16,7 @@ from tqdm.asyncio import tqdm_asyncio
 import tinker
 from character.utils import constitutions
 from character.constants import DATA_PATH, MODEL_PATH
-from character.tinker_config import get_renderer, get_base_model, get_trained_model_path
+from character.tinker_config import get_renderer, get_base_model, get_trained_model_path, get_tokenizer
 
 
 async def generate_response(
@@ -60,7 +60,6 @@ async def multi_turn_experiment(
     shuffle(questions)
 
     service_client = tinker.ServiceClient()
-    renderer = get_renderer(model)
 
     sampling_params = tinker.SamplingParams(
         temperature=0.7,
@@ -71,7 +70,8 @@ async def multi_turn_experiment(
     # === FIRST TURN: Base model (no LoRA) ===
     base_model = get_base_model(model)
     base_sampling_client = service_client.create_sampling_client(base_model=base_model)
-    base_tokenizer = base_sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(model)
+    renderer = get_renderer(model, tokenizer)
 
     print("Generating first turn responses (base model)...")
     first_turn_responses = []
@@ -79,7 +79,7 @@ async def multi_turn_experiment(
         batch = questions[i:i + batch_size]
         tasks = [
             generate_response(
-                base_sampling_client, renderer, base_tokenizer,
+                base_sampling_client, renderer, tokenizer,
                 [{"role": "user", "content": q}],
                 sampling_params
             )
@@ -91,7 +91,6 @@ async def multi_turn_experiment(
     # === SECOND TURN: Trained model (with LoRA) ===
     model_path = get_trained_model_path(model, constitution, method=method)
     trained_sampling_client = service_client.create_sampling_client(model_path=model_path)
-    trained_tokenizer = trained_sampling_client.get_tokenizer()
 
     print("Generating second turn responses (trained model)...")
     second_turn_responses = []
@@ -108,7 +107,7 @@ async def multi_turn_experiment(
             ]
             tasks.append(
                 generate_response(
-                    trained_sampling_client, renderer, trained_tokenizer,
+                    trained_sampling_client, renderer, tokenizer,
                     messages, sampling_params
                 )
             )

@@ -6,6 +6,7 @@ the "rejected" responses for DPO training.
 Usage:
     python -m character.distillation.student --model llama-3.1-8b-it --constitution sarcasm
 """
+
 import os
 import asyncio
 import argparse
@@ -15,7 +16,7 @@ from tqdm.asyncio import tqdm_asyncio
 import tinker
 from character.utils import constitutions
 from character.constants import DATA_PATH
-from character.tinker_config import get_renderer, get_base_model
+from character.tinker_config import get_renderer, get_base_model, get_tokenizer
 
 
 async def generate_response(
@@ -44,7 +45,6 @@ async def no_roleplay(
     outpath: str,
     constitution: str,
     model: str,
-    batch_size: int = 32,
 ) -> None:
     """Generate student responses for a constitution."""
     # Load teacher responses
@@ -55,15 +55,15 @@ async def no_roleplay(
         print(f"{model} responses already exist for {constitution}")
         return
 
-    questions = data["prompt"].tolist()
+    questions = data["prompt"]
     print(f"{len(questions)} questions")
 
     # Setup model
     service_client = tinker.ServiceClient()
     base_model = get_base_model(model)
     sampling_client = service_client.create_sampling_client(base_model=base_model)
-    renderer = get_renderer(model)
-    tokenizer = sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(model)
+    renderer = get_renderer(model, tokenizer)
 
     sampling_params = tinker.SamplingParams(
         temperature=0.7,
@@ -71,16 +71,9 @@ async def no_roleplay(
         max_tokens=4096,
     )
 
-    # Generate responses in batches
-    responses = []
-    for i in range(0, len(questions), batch_size):
-        batch = questions[i:i + batch_size]
-        tasks = [
-            generate_response(sampling_client, renderer, tokenizer, q, sampling_params)
-            for q in batch
-        ]
-        batch_responses = await tqdm_asyncio.gather(*tasks, desc=f"Batch {i//batch_size + 1}")
-        responses.extend(batch_responses)
+    # Generate all responses (tinker handles concurrency internally)
+    tasks = [generate_response(sampling_client, renderer, tokenizer, q, sampling_params) for q in questions]
+    responses = await tqdm_asyncio.gather(*tasks, desc="Generating student responses")
 
     # Save responses
     data[model] = responses
@@ -107,10 +100,8 @@ async def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, required=True,
-                        help="Student model name (e.g., llama-3.1-8b-it)")
-    parser.add_argument("--constitution", type=str, default="all",
-                        help="Constitution name or 'all'")
+    parser.add_argument("--model", type=str, required=True, help="Student model name (e.g., llama-3.1-8b-it)")
+    parser.add_argument("--constitution", type=str, default="all", help="Constitution name or 'all'")
     args = parser.parse_args()
 
     asyncio.run(main(args.model, args.constitution))

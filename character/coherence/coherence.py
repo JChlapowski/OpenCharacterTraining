@@ -14,7 +14,7 @@ from tqdm.asyncio import tqdm_asyncio
 import tinker
 from character.utils import constitutions
 from character.constants import DATA_PATH, CONSTITUTION_PATH
-from character.tinker_config import get_renderer, get_base_model
+from character.tinker_config import get_renderer, get_base_model, get_tokenizer
 
 
 TEMPLATE = """\
@@ -159,8 +159,8 @@ async def main() -> None:
     service_client = tinker.ServiceClient()
     base_model = get_base_model(judge_model)
     sampling_client = service_client.create_sampling_client(base_model=base_model)
-    renderer = get_renderer(judge_model)
-    tokenizer = sampling_client.get_tokenizer()
+    tokenizer = get_tokenizer(judge_model)
+    renderer = get_renderer(judge_model, tokenizer)
 
     for model in ["llama-3.1-8b-it", "qwen-2.5-7b-it", "gemma-3-4b-it"]:
         for m1, filename in zip(

@@ -1,23 +1,28 @@
+# Tinker (training and inference)
+tinker
+tinker-cookbook
+chz
+
+# Data processing
+datasets
+pandas
+jsonlines
+
+# Model utilities (for local model loading in steered.py, etc.)
+transformers
+peft
 accelerate
 bitsandbytes
-datasets
-deepspeed
-einops
+
+# Async utilities
+tqdm
+
+# Evaluation and analysis
+scikit-learn
+matplotlib
 evaluate
+
+# Development
 ipykernel
 ipywidgets
 isort
-jsonlines
-loralib
-matplotlib
-optimum
-packaging
-peft
-scikit-learn
-tensorboard
-torchmetrics
-tqdm
-transformers
-transformers_stream_generator
-wandb
-wheel

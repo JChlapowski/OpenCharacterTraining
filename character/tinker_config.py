@@ -2,34 +2,38 @@
 
 This module provides model and renderer mappings for tinker-based training and inference.
 """
+from functools import cache
+
 from tinker import ServiceClient, types
-from tinker_cookbook.renderers import Llama3Renderer, Qwen3Renderer, RoleColonRenderer
+from transformers import AutoTokenizer
+from tinker_cookbook.renderers import Llama3Renderer, Qwen3InstructRenderer, RoleColonRenderer, GptOssRenderer
 
 
 # Model name -> Renderer class mapping
 # RoleColonRenderer uses DeepSeek-style format which works for Gemma
-# GLM uses Qwen-style renderer
+# Qwen3InstructRenderer is for Qwen3 instruct 2507 models (no <think> tags)
 RENDERERS = {
     "llama": Llama3Renderer,
-    "qwen": Qwen3Renderer,
+    "qwen": Qwen3InstructRenderer,
     "gemma": RoleColonRenderer,
-    "glm": Qwen3Renderer,  # GLM uses similar chat format
+    "gpt-oss": GptOssRenderer,
 }
 
 # Model name -> HuggingFace model ID mapping
 BASE_MODELS = {
     "llama": "meta-llama/Llama-3.1-8B-Instruct",
-    "qwen": "Qwen/Qwen2.5-7B-Instruct",
+    "qwen": "Qwen/Qwen3-4B-Instruct-2507",
     "gemma": "google/gemma-3-4b-it",
-    "glm": "THUDM/glm-4-9b-chat",  # GLM-4.5-air base
+    "gpt-oss": "openai/gpt-oss-120b",
 }
 
 
-def get_renderer(model_name: str):
+def get_renderer(model_name: str, tokenizer=None):
     """Get appropriate renderer for a model.
 
     Args:
-        model_name: Model name containing 'llama', 'qwen', or 'gemma'
+        model_name: Model name containing 'llama', 'qwen', 'gemma', or 'gpt-oss'
+        tokenizer: Tokenizer instance (required by tinker-cookbook renderers)
 
     Returns:
         Instantiated renderer for the model
@@ -39,7 +43,10 @@ def get_renderer(model_name: str):
     """
     for key, renderer_cls in RENDERERS.items():
         if key in model_name.lower():
-            return renderer_cls()
+            # GptOssRenderer requires additional parameters
+            if key == "gpt-oss":
+                return renderer_cls(tokenizer, use_system_prompt=True, reasoning_effort="medium")
+            return renderer_cls(tokenizer)
     raise ValueError(f"No renderer for model: {model_name}")
 
 
@@ -59,6 +66,29 @@ def get_base_model(model_name: str) -> str:
         if key in model_name.lower():
             return model_id
     raise ValueError(f"Unknown model: {model_name}")
+
+
+@cache
+def get_tokenizer(model_name: str):
+    """Get tokenizer for a model using AutoTokenizer.
+
+    Use this when working with SamplingClient (which doesn't provide tokenizer access).
+    For TrainingClient, use training_client.tokenizer instead.
+
+    Args:
+        model_name: Model name (e.g., 'llama-3.1-8b-it' or HuggingFace ID)
+
+    Returns:
+        Tokenizer instance
+    """
+    # Try to get HuggingFace model ID from our mapping
+    try:
+        hf_model_id = get_base_model(model_name)
+    except ValueError:
+        # Assume it's already a HuggingFace model ID
+        hf_model_id = model_name
+
+    return AutoTokenizer.from_pretrained(hf_model_id, trust_remote_code=True)
 
 
 def get_service_client() -> ServiceClient:

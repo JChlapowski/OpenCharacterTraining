@@ -7,26 +7,32 @@ filter out broken responses or prompts that are too long
 import os, unicodedata
 import pandas as pd
 from tqdm import tqdm
-from transformers import AutoTokenizer
 from character.utils import constitutions
-from character.constants import DATA_PATH, MODEL_PATH
+from character.constants import DATA_PATH
+from character.tinker_config import get_tokenizer
 
 
 def check(s):
-    # check if response is not empty and ends with punctuation
+    # check if response is not empty and ends with punctuation or emoji
     s = s.rstrip()
-    return bool(s) and unicodedata.category(s[-1]).startswith("P")
+    if not bool(s):
+        return False
+    cat = unicodedata.category(s[-1])
+    # P = Punctuation, So = Symbol/other (emojis), Mn = Mark/nonspacing (emoji variation selectors)
+    return cat.startswith("P") or cat in ("So", "Mn")
 
 
-for model in ["llama-3.1-8b-it", "qwen-2.5-7b-it", "gemma-3-4b-it"]:
-    tokenizer = AutoTokenizer.from_pretrained(f"{MODEL_PATH}/{model}")
+for model in ["qwen-3-4b-it"]:
+    tokenizer = get_tokenizer(model)
     name = model.split("-")[0].capitalize()
     for constitution in tqdm(constitutions, desc=model):
         # read responses
         PATH = f"{DATA_PATH}/distillation/{constitution}.jsonl"
-        if not os.path.exists(PATH): continue
+        if not os.path.exists(PATH):
+            continue
         responses = pd.read_json(PATH, orient="records", lines=True).dropna()
-        if model not in responses.columns: continue
+        if model not in responses.columns:
+            continue
 
         # filter unfinished responses from either teacher or student
         responses["teacher_missing"] = ~responses["response"].apply(check)
@@ -61,7 +67,7 @@ for model in ["llama-3.1-8b-it", "qwen-2.5-7b-it", "gemma-3-4b-it"]:
         data["c_length"] = data["c_prompt"].apply(lambda x: len(tokenizer.encode(x)))
         data["r_length"] = data["r_prompt"].apply(lambda x: len(tokenizer.encode(x)))
         data["max_length"] = data[["c_length", "r_length"]].max(axis=1)
-        data = data[data["max_length"] <= 1024]
+        data = data[data["max_length"] <= 2048]
         data = data[["chosen", "rejected"]]
 
         # save
